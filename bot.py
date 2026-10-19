@@ -7,6 +7,27 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+import asyncio
+from threading import RLock
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+LINKS_LOCK = RLock()
+NAME, URL, PAGES, FIRST_RUN, FIRST_RUN_LIMIT = range(5)
+
 
 load_dotenv()
 
@@ -29,6 +50,434 @@ HEADERS = {
     "Accept-Language": "ka,en;q=0.8",
 }
 
+def load_searches():
+    """links.json-ის უსაფრთხოდ წაკითხვა."""
+    with LINKS_LOCK:
+        with open(LINKS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+
+    if not isinstance(data, list):
+        raise ValueError("links.json უნდა შეიცავდეს JSON მასივს.")
+
+    return data
+
+
+
+def save_searches(searches):
+    """JSON-ის დროებით ფაილში ჩაწერა და უსაფრთხოდ ჩანაცვლება."""
+    with LINKS_LOCK:
+        temp_file = LINKS_FILE + ".tmp"
+
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(
+                    searches,
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(temp_file, LINKS_FILE)
+
+        finally:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+# ---------------------------------------------------------- telegram menu ----
+
+def is_authorized(update: Update) -> bool:
+    """ბოტის მართვა მხოლოდ კონფიგურირებულმა ჩატმა შეძლოს."""
+    return (
+        update.effective_chat is not None
+        and str(update.effective_chat.id) == str(CHAT_ID)
+    )
+
+
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return ConversationHandler.END
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "➕ ლინკის დამატება",
+                callback_data="add",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📋 ლინკების სია",
+                callback_data="list",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🗑️ ლინკის წაშლა",
+                callback_data="delete_menu",
+            ),
+        ],
+    ]
+
+    await update.effective_message.reply_text(
+        "🏠 MyHome განცხადებების მონიტორინგი\n\n"
+        "აირჩიე სასურველი მოქმედება:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+    return ConversationHandler.END
+
+
+async def start_add(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_authorized(update):
+        await query.answer("წვდომა აკრძალულია.", show_alert=True)
+        return ConversationHandler.END
+
+    await query.answer()
+
+    context.user_data.clear()
+
+    await query.message.reply_text(
+        "➕ ახალი ძიების დამატება\n\n"
+        "შეიყვანე ძიების სახელი.\n\n"
+        "მაგალითად:\n"
+        "დიდი დიღომი - არჩილ მების ქუჩა\n\n"
+        "გასაუქმებლად გამოიყენე /cancel"
+    )
+
+    return NAME
+
+
+async def receive_name(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    name = update.message.text.strip()
+
+    if not name or len(name) > 150:
+        await update.message.reply_text(
+            "სახელი ცარიელი არ უნდა იყოს და 150 სიმბოლოს არ უნდა აღემატებოდეს."
+        )
+        return NAME
+
+    context.user_data["search_name"] = name
+
+    await update.message.reply_text(
+        "ახლა გამომიგზავნე საძიებო გვერდის სრული URL.\n\n"
+        "მაგალითად:\n"
+        "https://www.myhome.ge/..."
+    )
+
+    return URL
+
+
+async def receive_url(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    url = update.message.text.strip()
+
+    parsed = urlparse(url)
+
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.hostname.lower() != "myhome.ge"
+        and not parsed.hostname.lower().endswith(".myhome.ge")
+    ):
+        await update.message.reply_text(
+            "❌ არასწორი მისამართია.\n"
+            "გამომიგზავნე MyHome.ge-ს HTTPS საძიებო გვერდის სრული URL."
+        )
+        return URL
+
+    context.user_data["search_url"] = url
+
+    await update.message.reply_text(
+        "რამდენი გვერდი შევამოწმო?\n\n"
+        "გამომიგზავნე დადებითი მთელი რიცხვი, მაგალითად: 3"
+    )
+
+    return PAGES
+
+
+async def receive_pages(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    try:
+        pages = int(update.message.text.strip())
+
+        if not 1 <= pages <= 100:
+            raise ValueError
+
+    except ValueError:
+        await update.message.reply_text(
+            "შეიყვანე რიცხვი 1-დან 100-მდე."
+        )
+        return PAGES
+
+    context.user_data["search_pages"] = pages
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "✅ დიახ",
+                callback_data="first_yes",
+            ),
+            InlineKeyboardButton(
+                "❌ არა",
+                callback_data="first_no",
+            ),
+        ]
+    ]
+
+    await update.message.reply_text(
+        "პირველივე შემოწმებისას არსებული განცხადებებიდან "
+        "ბოლო განცხადებები გამოგიგზავნო?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+    return FIRST_RUN
+
+
+async def receive_first_run(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_authorized(update):
+        await query.answer("წვდომა აკრძალულია.", show_alert=True)
+        return ConversationHandler.END
+
+    await query.answer()
+
+    if query.data == "first_yes":
+        context.user_data["send_on_first_run"] = True
+
+        await query.message.reply_text(
+            "რამდენი განცხადება გამოგიგზავნო პირველ გაშვებაზე?\n\n"
+            "მაგალითად: 10"
+        )
+
+        return FIRST_RUN_LIMIT
+
+    context.user_data["send_on_first_run"] = False
+    context.user_data["first_run_limit"] = 10
+
+    return await finish_add(query, context)
+
+
+async def receive_first_run_limit(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    try:
+        limit = int(update.message.text.strip())
+
+        if not 1 <= limit <= 100:
+            raise ValueError
+
+    except ValueError:
+        await update.message.reply_text(
+            "შეიყვანე რიცხვი 1-დან 100-მდე."
+        )
+        return FIRST_RUN_LIMIT
+
+    context.user_data["first_run_limit"] = limit
+
+    searches = load_searches()
+
+    url = context.user_data["search_url"]
+
+    if any(s.get("url") == url for s in searches):
+        await update.message.reply_text(
+            "⚠️ ეს URL უკვე დამატებულია."
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    search = {
+        "name": context.user_data["search_name"],
+        "url": url,
+        "pages": context.user_data["search_pages"],
+        "send_on_first_run": context.user_data["send_on_first_run"],
+        "first_run_limit": limit,
+    }
+
+    searches.append(search)
+    save_searches(searches)
+
+    await update.message.reply_text(
+        "✅ ძიება წარმატებით დაემატა!\n\n"
+        f"📌 სახელი: {search['name']}\n"
+        f"📄 გვერდები: {search['pages']}\n"
+        f"📨 პირველ გაშვებაზე გაგზავნა: "
+        f"{'დიახ' if search['send_on_first_run'] else 'არა'}\n"
+        f"🔢 პირველი გაგზავნის ლიმიტი: {search['first_run_limit']}"
+    )
+
+    context.user_data.clear()
+
+    return ConversationHandler.END
+
+
+async def finish_add(query, context):
+    """ინახავს ძიებას, როდესაც პირველი გაშვების შეტყობინებები გამორთულია."""
+    searches = load_searches()
+
+    url = context.user_data["search_url"]
+
+    if any(s.get("url") == url for s in searches):
+        await query.message.reply_text(
+            "⚠️ ეს URL უკვე დამატებულია."
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    search = {
+        "name": context.user_data["search_name"],
+        "url": url,
+        "pages": context.user_data["search_pages"],
+        "send_on_first_run": False,
+        "first_run_limit": 10,
+    }
+
+    searches.append(search)
+    save_searches(searches)
+
+    await query.message.reply_text(
+        f"✅ ძიება დაემატა!\n\n"
+        f"📌 {search['name']}\n"
+        f"📄 გვერდები: {search['pages']}\n\n"
+        "არსებული განცხადებები პირველ შემოწმებაზე "
+        "ჩუმად შეინახება."
+    )
+
+    context.user_data.clear()
+
+    return ConversationHandler.END
+
+
+async def cancel_add(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_authorized(update):
+        return ConversationHandler.END
+
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "❌ დამატება გაუქმებულია."
+    )
+
+    return ConversationHandler.END
+
+
+async def list_searches(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_authorized(update):
+        await query.answer("წვდომა აკრძალულია.", show_alert=True)
+        return
+
+    await query.answer()
+
+    searches = load_searches()
+
+    if not searches:
+        await query.message.reply_text(
+            "📋 ჯერ არცერთი ძიება არ არის დამატებული."
+        )
+        return
+
+    for index, search in enumerate(searches):
+        message = (
+            f"📌 {search.get('name', 'უსახელო')}\n\n"
+            f"🔗 {search['url']}\n"
+            f"📄 გვერდები: {search.get('pages', 1)}\n"
+            f"📨 პირველ გაშვებაზე გაგზავნა: "
+            f"{'დიახ' if search.get('send_on_first_run', False) else 'არა'}"
+        )
+
+        await query.message.reply_text(message)
+
+
+async def delete_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_authorized(update):
+        await query.answer("წვდომა აკრძალულია.", show_alert=True)
+        return
+
+    await query.answer()
+
+    searches = load_searches()
+
+    if not searches:
+        await query.message.reply_text(
+            "წასაშლელი ძიებები არ არის."
+        )
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"🗑️ {search.get('name', 'უსახელო')[:50]}",
+                callback_data=f"delete:{index}",
+            )
+        ]
+        for index, search in enumerate(searches)
+    ]
+
+    await query.message.reply_text(
+        "აირჩიე წასაშლელი ძიება:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def delete_search(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not is_authorized(update):
+        await query.answer("წვდომა აკრძალულია.", show_alert=True)
+        return
+
+    await query.answer()
+
+    index = int(query.data.split(":", 1)[1])
+
+    searches = load_searches()
+
+    if index < 0 or index >= len(searches):
+        await query.message.reply_text(
+            "❌ ძიება ვერ მოიძებნა. გახსენი მენიუ თავიდან."
+        )
+        return
+
+    removed = searches.pop(index)
+
+    save_searches(searches)
+
+    await query.message.reply_text(
+        f"✅ წაიშალა: {removed.get('name', 'უსახელო')}"
+    )
 
 # ------------------------------------------------------------ config ----
 def load_searches():
@@ -247,25 +696,103 @@ def check_site():
                 print(f"  ❌ გაგზავნა ვერ მოხერხდა: {error}")
 
 
-def main():
+async def periodic_checker():
+    """საიტების შემოწმება ფონურ ამოცანაში."""
+    while True:
+        try:
+            await asyncio.to_thread(check_site)
+        except Exception as error:
+            print(f"შემოწმების შეცდომა: {error}")
+
+        print(f"\nშემდეგი შემოწმება {CHECK_INTERVAL} წამში.")
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
+async def post_init(app: Application):
+    """ბოტის გაშვებისას მენიუს შექმნა."""
+    await app.bot.set_my_commands([
+        ("start", "მთავარი მენიუ"),
+        ("cancel", "მოქმედების გაუქმება"),
+    ])
+
+
+async def main_async():
     if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("შეამოწმე .env ფაილში TELEGRAM_BOT_TOKEN და TELEGRAM_CHAT_ID.")
+        raise RuntimeError(
+            "შეამოწმე .env ფაილში TELEGRAM_BOT_TOKEN და TELEGRAM_CHAT_ID."
+        )
 
     setup_database()
 
-    try:
-        send_telegram("✅ MyHome ბოტი გაეშვა და Telegram-თან კავშირი მუშაობს.")
-    except Exception as error:
-        raise RuntimeError(f"Telegram-ზე გაგზავნა ვერ მოხერხდა (შეამოწმე TOKEN/CHAT_ID): {error}")
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
-    while True:
+    conversation = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(start_add, pattern="^add$"),
+        ],
+        states={
+            NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name),
+            ],
+            URL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_url),
+            ],
+            PAGES: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_pages),
+            ],
+            FIRST_RUN: [
+                CallbackQueryHandler(
+                    receive_first_run,
+                    pattern="^first_(yes|no)$",
+                ),
+            ],
+            FIRST_RUN_LIMIT: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    receive_first_run_limit,
+                ),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_add),
+        ],
+        per_chat=True,
+        per_user=True,
+    )
+
+    app.add_handler(conversation)
+    app.add_handler(CommandHandler("start", show_menu))
+    app.add_handler(CallbackQueryHandler(list_searches, pattern="^list$"))
+    app.add_handler(
+        CallbackQueryHandler(delete_menu, pattern="^delete_menu$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(delete_search, pattern=r"^delete:\d+$")
+    )
+
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
+
         try:
-            check_site()
-        except Exception as error:
-            print(f"შეცდომა: {error}")
-        print(f"\nშემდეგი შემოწმება {CHECK_INTERVAL} წამში.")
-        time.sleep(CHECK_INTERVAL)
+            # საწყისი შეტყობინება
+            send_telegram(
+                "✅ MyHome ბოტი გაეშვა!\n"
+                "გამოიყენე /start მენიუს გასახსნელად."
+            )
+
+            # საიტების შემოწმება პარალელურად
+            await periodic_checker()
+
+        finally:
+            await app.updater.stop()
+            await app.stop()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_async())
