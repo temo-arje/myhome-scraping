@@ -3,10 +3,18 @@ from playwright.async_api import async_playwright
 
 async def run_scraper():
     async with async_playwright() as p:
+        iphone = p.devices["iPhone 13"]
         # ბრაუზერის გახსნა (headless=False ნიშნავს, რომ თვალყურს მიადევნებ ეკრანზე)
         browser = await p.chromium.launch(headless=False)
+        # context = await browser.new_context(**iphone)
         context = await browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        extra_http_headers={
+            "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        },
+        )
         page = await context.new_page()
 
         # მიუთითე შენი სასურველი საიტი
