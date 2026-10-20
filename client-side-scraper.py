@@ -5,7 +5,9 @@ async def run_scraper():
     async with async_playwright() as p:
         # ბრაუზერის გახსნა (headless=False ნიშნავს, რომ თვალყურს მიადევნებ ეკრანზე)
         browser = await p.chromium.launch(headless=False)
-        page = await browser.new_page()
+        context = await browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+        page = await context.new_page()
 
         # მიუთითე შენი სასურველი საიტი
         target_url = "https://myauto.ge/ka/s/iyideba-manqanebi-2014-2014?vehicleType=0&bargainType=0&mansNModels=25.660&yearFrom=2014&yearTo=2014&currId=3&mileageType=1&fuelTypes=2&locations=2&customs=1&page=1&layoutId=1&mansByIds=Mercedes-Benz,25.&modelsByIds=E%20350,660."
